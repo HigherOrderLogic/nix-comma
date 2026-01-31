@@ -3,7 +3,9 @@ mod index;
 mod shell;
 
 use std::{
+    collections::HashMap,
     env,
+    ffi::OsStr,
     io::{self, Write},
     os::unix::prelude::CommandExt,
     path::Path,
@@ -11,8 +13,11 @@ use std::{
 };
 
 use cache::{Cache, CacheEntry};
-use clap::crate_version;
-use clap::Parser;
+use clap::{crate_version, CommandFactory, Parser};
+use clap_complete::{
+    engine::{ArgValueCompleter, CompletionCandidate},
+    CompleteEnv,
+};
 use log::{debug, error, trace};
 
 fn pick(picker: &str, derivations: &[String]) -> Option<String> {
@@ -230,8 +235,72 @@ fn confirmer(run_cmd: &Command) -> bool {
     }
 }
 
+fn binary_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return vec![];
+    };
+
+    if current.is_empty() {
+        return vec![];
+    }
+
+    let Ok(output) = Command::new("nix-locate")
+        .args(["--at-root", "--type", "x", "--type", "s"])
+        .arg(format!("/bin/{current}"))
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return vec![];
+    };
+
+    if !output.status.success() {
+        return vec![];
+    }
+
+    let Ok(stdout) = str::from_utf8(&output.stdout) else {
+        return vec![];
+    };
+
+    let mut binary_to_packages: HashMap<String, Vec<String>> = HashMap::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(bin_start) = trimmed.rfind("/bin/") {
+            let binary_name = trimmed[bin_start + 5..].to_string();
+
+            if let Some(package_name) = trimmed.split_whitespace().next() {
+                binary_to_packages
+                    .entry(binary_name)
+                    .or_default()
+                    .push(package_name.to_string());
+            }
+        }
+    }
+
+    let mut completions: Vec<CompletionCandidate> = binary_to_packages
+        .into_iter()
+        .map(|(binary, packages)| {
+            let help_text = packages.join(", ");
+            CompletionCandidate::new(binary).help(Some(help_text.into()))
+        })
+        .collect();
+
+    completions.sort_by(|a, b| a.get_value().cmp(b.get_value()));
+
+    // Limit results to avoid overwhelming the shell
+    completions.truncate(100);
+
+    completions
+}
+
 fn main() -> ExitCode {
     env_logger::init();
+
+    CompleteEnv::with_factory(Opt::command).complete();
 
     let args = Opt::parse();
 
@@ -264,16 +333,15 @@ fn main() -> ExitCode {
         }
     }
 
-    if args.cmd.is_empty() {
+    let Some(cmd) = args.cmd.split_first() else {
         return if args.empty_cache {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
         };
-    }
-
-    let command = &args.cmd[0];
-    let trail = &args.cmd[1..];
+    };
+    let command = cmd.0.as_ref();
+    let trail = cmd.1;
 
     if args.delete_entry {
         if let Some(ref mut cache) = cache {
@@ -382,7 +450,7 @@ fn main() -> ExitCode {
 
 /// Runs programs without installing them
 #[derive(Parser)]
-#[clap(version = crate_version!(), trailing_var_arg = true)]
+#[clap(version = crate_version!())]
 struct Opt {
     /// Generate the man page, then exit
     #[clap(long, hide = true)]
@@ -436,6 +504,10 @@ struct Opt {
     delete_entry: bool,
 
     /// Command to run
-    #[clap(required_unless_present_any = ["empty_cache", "mangen"], name = "cmd")]
+    #[clap(
+        required_unless_present_any = ["empty_cache", "mangen"],
+        trailing_var_arg = true,
+        add = ArgValueCompleter::new(binary_completer)
+    )]
     cmd: Vec<String>,
 }
